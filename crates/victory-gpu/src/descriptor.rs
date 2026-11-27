@@ -1947,6 +1947,90 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// Heap-sync stress (T-0043): a 65,536-slot placed view heap in
+    /// write-watched memory; each of 300 rounds copies 4,096 records as bytes
+    /// (a buffer view with a stride, a texture view or an empty record, the
+    /// slot and kind varying per round so kinds change in place), then times
+    /// one [`sync_heaps`]. Run once per setting of the switches it reads
+    /// (`VICTORY_HEAP_NOTE_KIND`, `VICTORY_HEAP_SYNC_LEAN`, ...); prints one
+    /// `heap-sync-stress {json}` line. Original code, GPL-3.0-or-later.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "stress workload: run by name with --ignored --nocapture"]
+    fn heap_sync_stress() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const SLOTS: u32 = 65_536;
+        const ROUNDS: u32 = 300;
+        const CHURN: u32 = 4_096;
+        let step = increment(VIEWS_KIND).unwrap() as usize;
+        let size = SLOTS as usize * step;
+        // SAFETY: a fresh allocation of our own.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        }
+        .cast::<u8>();
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: VIEWS_KIND, count: SLOTS, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: size as u64 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        assert!(heap(h).host().is_some(), "a host view heap");
+        // The records copied: a structured buffer view (stride 16), a 2D
+        // texture view, and an empty record.
+        let staging = vec![0u8; 3 * step];
+        let at = |i: usize| staging.as_ptr() as u64 + (i * step) as u64;
+        let buffer: [u32; 10] = [0, 1, 0x1688, 0, 0, 0, 256, 16, 0, 0];
+        let texture: [u32; 10] = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        create_srv(std::ptr::null(), std::ptr::null(), &buffer, at(0));
+        create_srv(std::ptr::null(), std::ptr::null(), &texture, at(1));
+        let records: Vec<&[u8]> = (0..3).map(|i| &staging[i * step..(i + 1) * step]).collect();
+        let hash = |mut x: u32| {
+            x ^= x >> 16;
+            x = x.wrapping_mul(0x7feb_352d);
+            x ^= x >> 15;
+            x = x.wrapping_mul(0x846c_a68b);
+            x ^ (x >> 16)
+        };
+        let mut times = Vec::with_capacity(ROUNDS as usize);
+        for round in 0..ROUNDS {
+            for i in 0..CHURN {
+                let r = hash(round.wrapping_mul(0x9e37_79b9).wrapping_add(i));
+                let (slot, pick) = (r % SLOTS, (r >> 8) % 100);
+                let from = if pick < 20 { records[1] } else if pick & 1 == 1 { records[0] } else { records[2] };
+                // SAFETY: `slot` is inside the heap's memory.
+                unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), memory.add(slot as usize * step), step) };
+            }
+            let began = std::time::Instant::now();
+            sync_heaps();
+            times.push(began.elapsed().as_nanos() as u64);
+        }
+        let pages = SYNCED[0].swap(0, std::sync::atomic::Ordering::Relaxed);
+        let mirrored = SYNCED[2].swap(0, std::sync::atomic::Ordering::Relaxed);
+        // The first rounds fill the heap; the steady state is measured.
+        let mut steady: Vec<u64> = times[20..].to_vec();
+        steady.sort_unstable();
+        let pct = |p: f64| steady[((steady.len() - 1) as f64 * p) as usize] as f64 / 1e6;
+        let mean = steady.iter().sum::<u64>() as f64 / steady.len() as f64 / 1e6;
+        let var = |k: &str| std::env::var(k).unwrap_or_default();
+        println!(
+            "heap-sync-stress {{\"note_kind\": \"{}\", \"sync_lean\": \"{}\", \"rounds\": {ROUNDS}, \"churn\": {CHURN}, \"sync_ms_mean\": {mean:.4}, \"sync_ms_p50\": {:.4}, \"sync_ms_p99\": {:.4}, \"sync_ms_max\": {:.4}, \"pages_per_round\": {:.1}, \"mirrored_per_round\": {:.1}}}",
+            var("VICTORY_HEAP_NOTE_KIND"),
+            var("VICTORY_HEAP_SYNC_LEAN"),
+            pct(0.5),
+            pct(0.99),
+            pct(1.0),
+            pages as f64 / f64::from(ROUNDS),
+            mirrored as f64 / f64::from(ROUNDS),
+        );
+        assert!(pages > 0 && mirrored > 0, "the sync saw the copies");
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
