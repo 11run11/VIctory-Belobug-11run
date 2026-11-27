@@ -47,7 +47,7 @@ const TRIM_STEP: u64 = 64 * MIB;
 const TRIM_WINDOW_MS: u64 = 16;
 
 /// Bytes of levels kept in memory at most for a host with `total` bytes of
-/// RAM whose smaller of free RAM and free commit is `headroom`: a quarter of
+/// RAM whose free commit (commit limit less commit charge) is `headroom`: a quarter of
 /// [`KEPT`] on PCs with 32 GiB or less, at most an eighth of the headroom,
 /// and from 6 GiB of headroom down to 2 GiB a ramp from that eighth
 /// (768 MiB) to nothing, with no step a frame would pay for at once.
@@ -71,6 +71,9 @@ fn bounded() -> bool {
 }
 
 /// [`kept_limit`] for this host, sampled at most every 250 ms.
+/// The last sample's free RAM (high 32 bits) and free commit (low), in MiB.
+static HEADROOM: AtomicU64 = AtomicU64::new(0);
+
 fn live_limit() -> u64 {
     static LIMIT: AtomicU64 = AtomicU64::new(KEPT);
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -85,8 +88,14 @@ fn live_limit() -> u64 {
         let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
-            let headroom = status.ullAvailPhys.min(status.ullAvailPageFile);
+            // Free commit, not free RAM (#625 review): running out of commit is what ends a
+            // title (E_OUTOFMEMORY, #600); under RAM pressure alone the system pages the kept
+            // levels out, and letting them go only turned hits into reads from the folder on
+            // the lookup's thread (lowest free RAM unchanged, p99 frame time doubled).
+            let headroom = status.ullAvailPageFile;
             LIMIT.store(kept_limit(true, status.ullTotalPhys, headroom), Relaxed);
+            let mib = |b: u64| (b >> 20).min(u64::from(u32::MAX));
+            HEADROOM.store(mib(status.ullAvailPhys) << 32 | mib(status.ullAvailPageFile), Relaxed);
         }
     }
     LIMIT.load(Relaxed)
@@ -412,11 +421,13 @@ pub(crate) fn line() -> Option<String> {
     };
     Some(format!(
         "texture store (VICTORY_TEXTURE_STORE), since the start: {at_start} keys from earlier runs, {kept} textures kept \
-         ({} MB written, {} MB held in memory, limit {} MB, {} let go), {asked} first views from a smaller level asked, \
+         ({} MB written, {} MB held in memory, limit {} MB at {} MB free commit and {} MB free RAM, {} let go), {asked} first views from a smaller level asked, \
          {found} found ({read} read from the folder), {} host copies made whole from it",
         written >> 20,
         kept_bytes >> 20,
         live_limit() >> 20,
+        HEADROOM.load(Relaxed) & 0xffff_ffff,
+        HEADROOM.load(Relaxed) >> 32,
         evicted,
         PREFILLED.load(Relaxed)
     ))
