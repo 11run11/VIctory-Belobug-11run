@@ -41,7 +41,9 @@ ByteAddressBuffer src3 : register(t3);
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// 2^27 unless VICTORY_INDIRECT_BUDGET_LOG2 says otherwise (`make_with`;
+// modified for the XboxCompatibility project, T-0038).
+static const uint BUDGET = 1u << BUDGET_LOG2;
 static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
 groupshared uint fits[64];

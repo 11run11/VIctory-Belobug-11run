@@ -61,7 +61,9 @@ RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// 2^27 unless VICTORY_INDIRECT_BUDGET_LOG2 says otherwise (`make_with`;
+// modified for the XboxCompatibility project, T-0038).
+static const uint BUDGET = 1u << BUDGET_LOG2;
 // The vertices or indices an instance from which a draw record runs empty.
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
@@ -303,10 +305,46 @@ fn rest() -> u32 {
     u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
 }
 
+/// The budget of indirect work (vertex instances, threads) a list's records
+/// share, as a power of two: 2^27 unless `VICTORY_INDIRECT_BUDGET_LOG2` names
+/// 24 to 31. More lets a list whose legitimate draws total over 2^27 keep
+/// its last draws (the synthetic foliage scene, `tests/foliage.rs`: whole
+/// grass patches vanish and come back as the camera pans at 2^27, none at
+/// 2^28), at the cost of a longer worst-case list. Modified for the
+/// XboxCompatibility project (T-0038).
+pub(crate) const DEFAULT_BUDGET_LOG2: u32 = 27;
+
+fn parse_budget_log2(v: Option<&str>) -> u32 {
+    v.and_then(|v| v.parse::<u32>().ok()).filter(|n| (24..=31).contains(n)).unwrap_or(DEFAULT_BUDGET_LOG2)
+}
+
+pub(crate) fn budget_log2() -> u32 {
+    static LOG2: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LOG2.get_or_init(|| {
+        let log2 = parse_budget_log2(std::env::var("VICTORY_INDIRECT_BUDGET_LOG2").ok().as_deref());
+        if log2 != DEFAULT_BUDGET_LOG2 {
+            tracing::info!(log2, "indirect work budget per list set by VICTORY_INDIRECT_BUDGET_LOG2");
+        }
+        log2
+    })
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
-/// replaced).
+/// replaced), with the budget and rest rule the environment selects.
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    make_with(device, source, budget_log2(), rest() != 0)
+}
+
+/// The clamp compiled from `source` with an explicit budget (2^`log2`) and
+/// rest rule (`rest`: a record that does not fit takes what is left).
+fn make_with(device: &ID3D12Device, source: &str, log2: u32, rest: bool) -> windows::core::Result<Clamp> {
+    debug_assert!((24..=31).contains(&log2));
+    let source = &format!(
+        "#define WIDEST {}u\n#define REST {}\n#define BUDGET_LOG2 {}u\n{source}",
+        widest(amd(device)),
+        u32::from(rest),
+        log2
+    );
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -636,6 +674,9 @@ pub(crate) mod tests {
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
+
+    // The synthetic foliage scene (XboxCompatibility T-0038).
+    mod foliage;
 
     const WORKER_CS: &str = r#"
 #define RS "UAV(u0)"
