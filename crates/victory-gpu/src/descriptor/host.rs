@@ -13,6 +13,9 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// T-0041: opt-in `VICTORY_HEAP_NOTE_KIND` and `VICTORY_HEAP_SYNC_LEAN`.
+pub(crate) mod fps_set;
+
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
 /// a set of 70,000 under its lock kept everyone who writes slots waiting for
 /// 5 ms of a frame, timeline thin-6).
@@ -232,6 +235,9 @@ pub(crate) struct HostHeap {
     /// another's view made stale stays, which says only "may"): a write of
     /// any other view needs nothing of `placed` ([`spans_quick`]).
     spanned: Slots,
+    /// What each title slot's last full note left it as
+    /// (`VICTORY_HEAP_NOTE_KIND`, [`fps_set`]; empty when the switch is off).
+    kinds: fps_set::Kinds,
 }
 
 /// Whether a slot's write of no placed texture view leaves `placed` alone
@@ -1772,6 +1778,11 @@ impl HostHeap {
                 spans
             },
             spanned: Slots::new((count + extra) as usize),
+            kinds: fps_set::Kinds::new(if sampler || fps_set::note_kind() == fps_set::Mode::Off {
+                0
+            } else {
+                (count + extra) as usize
+            }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2691,7 +2702,38 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
+        // T-0041 (`VICTORY_HEAP_NOTE_KIND`, [`fps_set`]): from and to a bare
+        // or plain buffer slot, neither the queue nor the spans hold it.
+        let kind_mode = fps_set::note_kind();
+        let kind_now = if texture || kind_mode == fps_set::Mode::Off {
+            fps_set::TEXTURE
+        } else if view.and_then(view_stride).is_some() {
+            fps_set::PLAIN
+        } else {
+            fps_set::BARE
+        };
+        let short = kind_mode != fps_set::Mode::Off && fps_set::short(self.kinds.get(index), kind_now);
+        let skip = short && kind_mode == fps_set::Mode::On;
+        if skip {
+            fps_set::count(0);
+        } else if short {
+            fps_set::count(1);
+            let bit = 1u64 << (index % 64);
+            let spanned = self
+                .spanned
+                .0
+                .get(index as usize / 64)
+                .is_some_and(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0);
+            if spanned || self.queued.may(index) {
+                fps_set::count(2);
+            }
+        }
+        if kind_mode != fps_set::Mode::Off {
+            self.kinds.set(index, kind_now);
+        }
+        if !skip {
+            self.queue_texture(index, texture, seen, crate::frame::current());
+        }
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
@@ -2715,7 +2757,9 @@ impl HostHeap {
             let bit = 1u64 << (index % 64);
             self.spanned.0.get(index as usize / 64).is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
         };
-        let stale = if placed_view.is_none() && !in_spans(index) && spans_quick() {
+        let stale = if skip {
+            Vec::new()
+        } else if placed_view.is_none() && !in_spans(index) && spans_quick() {
             SPANS_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Vec::new()
         } else {
@@ -3257,6 +3301,13 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_from(index, handle, for_draw, None)
+    }
+
+    /// [`HostHeap::mirror`]; with `record` (T-0041, `VICTORY_HEAP_SYNC_LEAN`,
+    /// [`fps_set`]) the slot's first three record words as the heap sync's
+    /// compare step read them, instead of reading them again at `handle`.
+    pub(crate) fn mirror_from(&self, index: u32, handle: u64, for_draw: bool, record: Option<[u32; 3]>) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -3271,8 +3322,11 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let [tag, i, generation] = match record {
+            Some(record) => record,
+            // SAFETY: the handle is a descriptor slot in title memory.
+            None => unsafe { (handle as *const [u32; 3]).read_unaligned() },
+        };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record, and nothing has changed it: most of the

@@ -419,6 +419,8 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
+        let lean = host::fps_set::sync_lean();
+        let mut make_records: Vec<[u32; 3]> = Vec::new();
         let mut taken_in_check: Vec<(u32, u32)> = Vec::new();
         // Ranges of the heap to look at, and whether a range is one the
         // fallback of renderer port #2 looks at whole.
@@ -566,6 +568,9 @@ pub(crate) fn sync_heaps() {
                         continue;
                     }
                     out.make.push(index);
+                    if lean != host::fps_set::Mode::Off {
+                        out.records.push([word(0), word(1), word(2)]);
+                    }
                     out.kinds[if samplers {
                         3
                     } else if word(0) != VIEW_TAG {
@@ -598,6 +603,7 @@ pub(crate) fn sync_heaps() {
             mirrored += part.make.len() as u64;
             wait.append(&mut part.wait);
             make.append(&mut part.make);
+            make_records.append(&mut part.records);
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
             }
@@ -609,8 +615,31 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let phase = crate::timeline::span("the heaps' records: made");
         crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
-            for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+            let indices = make.chunks(records_a_job).nth(n).unwrap_or_default();
+            // T-0041 (`VICTORY_HEAP_SYNC_LEAN`, `host::fps_set`): made from the
+            // records as compared (both lists are in the same order).
+            let records = make_records.chunks(records_a_job).nth(n).filter(|r| r.len() == indices.len());
+            for (k, &index) in indices.iter().enumerate() {
+                let handle = start + u64::from(index) * step;
+                let record = records.map(|r| r[k]);
+                match (lean, record) {
+                    (host::fps_set::Mode::On, Some(record)) => {
+                        host::fps_set::count(3);
+                        host.mirror_from(index, handle, false, Some(record));
+                    }
+                    (host::fps_set::Mode::Check, Some(record)) => {
+                        host::fps_set::count(4);
+                        // SAFETY: as `HostHeap::mirror`, a descriptor slot in title memory.
+                        let now = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                        if now != record {
+                            host::fps_set::count(5);
+                        }
+                        host.mirror(index, handle, false);
+                    }
+                    _ => {
+                        host.mirror(index, handle, false);
+                    }
+                }
             }
         });
         phase.end();
@@ -712,6 +741,9 @@ struct SyncPart {
     tabled: u64,
     nothing: u64,
     make: Vec<u32>,
+    /// With `VICTORY_HEAP_SYNC_LEAN` (T-0041): the first three words of each
+    /// record of `make`, as compared; else empty.
+    records: Vec<[u32; 3]>,
     wait: Vec<u32>,
     kinds: [u64; 5],
     /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
@@ -763,6 +795,7 @@ pub(crate) fn sync_line(frames: f64) {
     let jobs = [0, 1, 2].map(|i| SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames);
     let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let short = SYNC_SHORT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    host::fps_set::line(frames);
     if pages == 0 {
         return;
     }
