@@ -41,6 +41,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Queued at creation by [`early`] off the early list ([`EAGER`]).
+    eager: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
 }
@@ -68,6 +70,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            eager: AtomicBool::new(false),
         }
     }
 
@@ -400,6 +403,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        if p.eager.load(Ordering::Relaxed) {
+            EAGER_USED.fetch_add(1, Ordering::Relaxed);
+        }
     }
     if p.made.get().is_none() {
         start(p, REQUESTED, None);
@@ -439,6 +445,9 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Pipelines queued at creation by [`early`] without being on the early list.
 pub(crate) static EAGER: AtomicU64 = AtomicU64::new(0);
+/// Of [`EAGER`], those a draw or dispatch has used since (the rest were
+/// made for nothing so far).
+pub(crate) static EAGER_USED: AtomicU64 = AtomicU64::new(0);
 
 /// Up to how many queued pipelines a new one is still queued at creation
 /// (`VICTORY_PIPELINE_EAGER`: 0 off, as before; default 256). Bounded so a
@@ -649,21 +658,31 @@ fn start(p: &Arc<Pending>, priority: u8, speculative_limit: Option<u64>) {
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    let admitted = match speculative_limit {
-        Some(limit) => queue.push_eager(p, WAITING.load(Ordering::Relaxed), limit),
-        None => queue.push(p, priority),
-    };
-    if let Some(new) = admitted {
-        if new {
-            if speculative_limit.is_some() {
-                EAGER.fetch_add(1, Ordering::Relaxed);
-            }
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        }
+    if admit(&mut queue, p, priority, speculative_limit, &WAITING).is_some() {
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
         AVAILABLE.notify_all();
     }
+}
+
+/// Queues `p` (`queue` is [`QUEUE`], held) and counts it in `waiting`
+/// ([`WAITING`]) if it is new. A speculative start (`speculative_limit`) is
+/// admitted only while fewer than the limit wait; the count is read and
+/// raised under the lock, and workers only ever lower it, so the limit holds
+/// however many threads create pipelines at once.
+fn admit(queue: &mut Queue, p: &Arc<Pending>, priority: u8, speculative_limit: Option<u64>, waiting: &AtomicU64) -> Option<bool> {
+    let admitted = match speculative_limit {
+        Some(limit) => queue.push_eager(p, waiting.load(Ordering::Relaxed), limit),
+        None => queue.push(p, priority),
+    };
+    if admitted == Some(true) {
+        if speculative_limit.is_some() {
+            EAGER.fetch_add(1, Ordering::Relaxed);
+            p.eager.store(true, Ordering::Relaxed);
+        }
+        PEAK.fetch_max(waiting.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+    }
+    admitted
 }
 
 /// Workers that make passes over the screen alone, besides the others.
@@ -770,6 +789,8 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            queued_at_creation = EAGER.load(Ordering::Relaxed),
+            queued_at_creation_used = EAGER_USED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -860,6 +881,55 @@ mod tests {
         assert_eq!(second.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         assert_eq!(queue.push(&second, REQUESTED), Some(true));
         assert_eq!(queue.push(&first, REQUESTED), Some(false));
+    }
+
+    /// Many threads creating pipelines at once never admit more speculative
+    /// ones than the limit (T-0037 review).
+    #[test]
+    fn concurrent_speculative_admission_holds_the_limit() {
+        const THREADS: usize = 8;
+        const EACH: usize = 200;
+        const LIMIT: u64 = 64;
+        let queue = std::sync::Mutex::new(Queue::new());
+        let waiting = AtomicU64::new(0);
+        let admitted = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    for _ in 0..EACH {
+                        let p = Arc::new(Pending::new(Vec::new(), None));
+                        let mut q = queue.lock().unwrap();
+                        if admit(&mut q, &p, EARLY, Some(LIMIT), &waiting) == Some(true) {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), LIMIT);
+        assert_eq!(waiting.load(Ordering::Relaxed), LIMIT);
+        assert!(queue.lock().unwrap().early.iter().all(|p| p.eager.load(Ordering::Relaxed)));
+    }
+
+    /// A pipeline a draw asks for is taken before every speculative one
+    /// queued earlier, however many (T-0037 review): requested work waits at
+    /// most for the speculative pipelines already being made.
+    #[test]
+    fn requested_work_goes_before_queued_speculative_work() {
+        let mut queue = Queue::new();
+        let waiting = AtomicU64::new(0);
+        let eager: Vec<_> = (0..200).map(|_| Arc::new(Pending::new(Vec::new(), None))).collect();
+        for p in &eager {
+            assert_eq!(admit(&mut queue, p, EARLY, Some(256), &waiting), Some(true));
+        }
+        let asked = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(admit(&mut queue, &asked, REQUESTED, None, &waiting), Some(true));
+        let first = queue.pop(false, usize::MAX).expect("one queued");
+        assert!(Arc::ptr_eq(&first, &asked), "the requested pipeline first");
+        // A speculative one a draw then asks for is promoted ahead of the rest.
+        assert_eq!(admit(&mut queue, &eager[150], REQUESTED, None, &waiting), Some(false));
+        let next = queue.pop(false, usize::MAX).expect("queued");
+        assert!(Arc::ptr_eq(&next, &eager[150]));
     }
 
     #[test]
