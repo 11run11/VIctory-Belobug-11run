@@ -1,0 +1,79 @@
+# Fork-only CI for 11run11/VIctory-Belobug-11run. Lives on `development` only, never in a branch
+# proposed upstream. The jobs are Belobug's ci.yml jobs, unchanged; keep them in step with it.
+# Upstream-bound branches (feature/fix/performance/experiment) run Belobug's own ci.yml through a
+# fork-internal draft PR (tools/fork_ci.sh open <branch>), on every push to them.
+name: Fork CI
+
+on:
+  push:
+    branches: [development]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to test (default the dispatched ref)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy, diagnostics build
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test-default:
+    name: Default tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  test-diagnostics:
+    name: Diagnostics tests
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --locked -- --test-threads=1
+
+  check:
+    needs: [clippy, test-default, test-diagnostics]
+    if: always()
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Require all three jobs to pass
+        run: |
+          if ('${{ needs.clippy.result }}' -ne 'success' -or
+              '${{ needs.test-default.result }}' -ne 'success' -or
+              '${{ needs.test-diagnostics.result }}' -ne 'success') {
+            exit 1
+          }
