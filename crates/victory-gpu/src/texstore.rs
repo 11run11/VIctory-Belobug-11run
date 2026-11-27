@@ -40,13 +40,17 @@ const KEPT: u64 = 4 << 30;
 // let go and read back. `VICTORY_TEXSTORE_BOUND=0` keeps the old fixed bound.
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
-/// Bytes let go at most per [`Kept::trim`].
+/// Bytes let go at most per [`TRIM_WINDOW_MS`], however often
+/// [`Kept::trim`] is called: a sudden drop of the limit is spread over
+/// several frames instead of one long stall (T-0044).
 const TRIM_STEP: u64 = 64 * MIB;
+const TRIM_WINDOW_MS: u64 = 16;
 
 /// Bytes of levels kept in memory at most for a host with `total` bytes of
 /// RAM whose smaller of free RAM and free commit is `headroom`: a quarter of
 /// [`KEPT`] on PCs with 32 GiB or less, at most an eighth of the headroom,
-/// 256 MiB below 6 GiB of headroom and nothing below 2 GiB.
+/// and from 6 GiB of headroom down to 2 GiB a ramp from that eighth
+/// (768 MiB) to nothing, with no step a frame would pay for at once.
 pub(crate) fn kept_limit(bounded: bool, total: u64, headroom: u64) -> u64 {
     if !bounded {
         return KEPT;
@@ -55,7 +59,7 @@ pub(crate) fn kept_limit(bounded: bool, total: u64, headroom: u64) -> u64 {
     if headroom < 2 * GIB {
         0
     } else if headroom < 6 * GIB {
-        base.min(256 * MIB)
+        base.min((headroom - 2 * GIB) / 16 * 3)
     } else {
         base.min(headroom / 8)
     }
@@ -96,7 +100,14 @@ struct Kept {
     tick: u64,
     /// Blobs let go to stay within the limit, since the start.
     evicted: u64,
+    /// The current [`TRIM_WINDOW_MS`] window and the bytes let go in it.
+    window: u64,
+    freed: u64,
 }
+
+/// Levels let go by [`Kept::trim`]: dropped by the caller once the store's
+/// lock is released, so freeing them never holds up other lookups.
+type Gone = Vec<Arc<Vec<u8>>>;
 
 impl Kept {
     fn get(&mut self, blob: u128) -> Option<Arc<Vec<u8>>> {
@@ -109,36 +120,59 @@ impl Kept {
     }
 
     /// Lets the least recently used go until at most `limit` bytes are kept,
-    /// [`TRIM_STEP`] bytes at most per call so that a sudden drop of the
-    /// limit is spread over several calls instead of one long stall.
-    fn trim(&mut self, limit: u64) {
-        let floor = self.bytes.saturating_sub(TRIM_STEP);
-        while self.bytes > limit && self.bytes > floor {
-            let Some((&blob, _)) = self.map.iter().min_by_key(|(_, (_, used))| *used) else {
-                break;
-            };
-            if let Some((bytes, _)) = self.map.remove(&blob) {
-                self.bytes -= bytes.len() as u64;
-                self.evicted += 1;
-            }
+    /// [`TRIM_STEP`] bytes at most per [`TRIM_WINDOW_MS`].
+    fn trim(&mut self, limit: u64) -> Gone {
+        self.trim_at(limit, crate::host::coarse_ms())
+    }
+
+    fn trim_at(&mut self, limit: u64, now_ms: u64) -> Gone {
+        let mut gone = Gone::new();
+        if self.bytes <= limit {
+            return gone;
         }
+        let window = now_ms / TRIM_WINDOW_MS;
+        if window != self.window {
+            (self.window, self.freed) = (window, 0);
+        }
+        while self.bytes > limit && self.freed < TRIM_STEP {
+            let Some(len) = self.evict_oldest(&mut gone) else { break };
+            self.freed += len;
+        }
+        gone
+    }
+
+    /// Lets the least recently used go; its size, or `None` if none is kept.
+    fn evict_oldest(&mut self, gone: &mut Gone) -> Option<u64> {
+        let (&blob, _) = self.map.iter().min_by_key(|(_, (_, used))| *used)?;
+        let (bytes, _) = self.map.remove(&blob)?;
+        let len = bytes.len() as u64;
+        self.bytes -= len;
+        self.evicted += 1;
+        gone.push(bytes);
+        Some(len)
     }
 
     /// Keeps `bytes` if room for them within `limit` is made by letting older
     /// ones go ([`trim`](Self::trim)); otherwise they are only on disk.
-    fn insert(&mut self, blob: u128, bytes: &Arc<Vec<u8>>, limit: u64) {
+    fn insert(&mut self, blob: u128, bytes: &Arc<Vec<u8>>, limit: u64) -> Gone {
         let len = bytes.len() as u64;
         if self.map.contains_key(&blob) || len > limit {
-            self.trim(limit);
-            return;
+            return self.trim(limit);
         }
-        self.trim(limit - len);
-        if self.bytes + len > limit {
-            return;
+        // What is over the limit goes at the trim's pace; room for the new
+        // levels within it is made at once (one for one, no stall to spread).
+        let mut gone = self.trim(limit);
+        while self.bytes <= limit && self.bytes + len > limit {
+            if self.evict_oldest(&mut gone).is_none() {
+                break;
+            }
         }
-        self.tick += 1;
-        self.bytes += len;
-        self.map.insert(blob, (bytes.clone(), self.tick));
+        if self.bytes + len <= limit {
+            self.tick += 1;
+            self.bytes += len;
+            self.map.insert(blob, (bytes.clone(), self.tick));
+        }
+        gone
     }
 }
 
@@ -330,7 +364,8 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, &bytes, live_limit());
+    let gone = store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, &bytes, live_limit());
+    drop(gone);
     STATS[1].fetch_add(1, Relaxed);
     Some((blob, bytes, entries))
 }
@@ -346,19 +381,20 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
     if entry.levels != level {
         return None;
     }
-    let kept = {
+    let (kept, gone) = {
         let mut kept = store.kept.lock().unwrap_or_else(|e| e.into_inner());
         let hit = kept.get(entry.blob);
         // (A hit also lets go what no longer fits when memory got short.)
-        kept.trim(live_limit());
-        hit
+        (hit, kept.trim(live_limit()))
     };
+    drop(gone);
     let bytes = match kept {
         Some(bytes) => bytes,
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, &bytes, live_limit());
+            let gone = store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, &bytes, live_limit());
+            drop(gone);
             bytes
         }
     };
@@ -413,8 +449,18 @@ mod tests {
         // At most an eighth of the headroom.
         assert_eq!(kept_limit(true, 64 * GIB, 8 * GIB), GIB);
         // Watch and high pressure.
-        assert_eq!(kept_limit(true, 64 * GIB, 5 * GIB), 256 * MIB);
+        assert_eq!(kept_limit(true, 64 * GIB, 5 * GIB), 576 * MIB);
         assert_eq!(kept_limit(true, 32 * GIB, 2 * GIB - 1), 0);
+        // No step between the ramp and an eighth of the headroom, nor at 2 GiB.
+        assert_eq!(kept_limit(true, 64 * GIB, 6 * GIB - 16), kept_limit(true, 64 * GIB, 6 * GIB) - 3);
+        assert_eq!(kept_limit(true, 64 * GIB, 2 * GIB), 0);
+        // Falling headroom never raises the limit.
+        let mut last = u64::MAX;
+        for h in (0..=12 * 16).rev().map(|n| n * GIB / 16) {
+            let now = kept_limit(true, 64 * GIB, h);
+            assert!(now <= last, "{h}: {now} > {last}");
+            last = now;
+        }
     }
 
     #[test]
@@ -448,13 +494,24 @@ mod tests {
             kept.insert(blob, &mib, GIB);
         }
         assert_eq!(kept.bytes, 200 * MIB);
-        kept.trim(0);
-        assert_eq!(kept.bytes, 200 * MIB - TRIM_STEP, "one step per call");
+        // One step per window however many calls (T-0044: a lookup calls
+        // trim, and a frame makes many lookups).
+        let t = 1000 * TRIM_WINDOW_MS;
+        let gone = kept.trim_at(0, t);
+        assert_eq!((gone.len() as u64, kept.bytes), (TRIM_STEP / MIB, 200 * MIB - TRIM_STEP));
+        for _ in 0..10 {
+            assert!(kept.trim_at(0, t + TRIM_WINDOW_MS - 1).is_empty(), "same window");
+        }
+        assert_eq!(kept.bytes, 200 * MIB - TRIM_STEP);
+        // Levels let go are handed back, not freed under the lock.
+        assert!(Arc::strong_count(&mib) > 1 + kept.map.len());
+        drop(gone);
+        assert_eq!(Arc::strong_count(&mib), 1 + kept.map.len());
         // While above the limit a new texture is not kept.
         kept.insert(1000, &mib, 8 * MIB);
         assert!(kept.get(1000).is_none());
-        for _ in 0..4 {
-            kept.trim(8 * MIB);
+        for w in 1..=4 {
+            kept.trim_at(8 * MIB, t + w * TRIM_WINDOW_MS);
         }
         assert_eq!(kept.bytes, 8 * MIB);
     }
