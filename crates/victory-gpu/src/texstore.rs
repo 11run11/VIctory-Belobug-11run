@@ -35,6 +35,113 @@ pub(crate) const MIN_PREFIX: u64 = 32 << 10;
 /// when asked).
 const KEPT: u64 = 4 << 30;
 
+// T-0039 (original code, GPL-3.0-or-later): the kept levels are a cache of
+// files the store always writes, so under host-memory pressure they can be
+// let go and read back. `VICTORY_TEXSTORE_BOUND=0` keeps the old fixed bound.
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+/// Bytes let go at most per [`Kept::trim`].
+const TRIM_STEP: u64 = 64 * MIB;
+
+/// Bytes of levels kept in memory at most for a host with `total` bytes of
+/// RAM whose smaller of free RAM and free commit is `headroom`: a quarter of
+/// [`KEPT`] on PCs with 32 GiB or less, at most an eighth of the headroom,
+/// 256 MiB below 6 GiB of headroom and nothing below 2 GiB.
+pub(crate) fn kept_limit(bounded: bool, total: u64, headroom: u64) -> u64 {
+    if !bounded {
+        return KEPT;
+    }
+    let base = if total <= 32 * GIB { KEPT / 4 } else { KEPT };
+    if headroom < 2 * GIB {
+        0
+    } else if headroom < 6 * GIB {
+        base.min(256 * MIB)
+    } else {
+        base.min(headroom / 8)
+    }
+}
+
+fn bounded() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXSTORE_BOUND").is_none_or(|v| v != "0"))
+}
+
+/// [`kept_limit`] for this host, sampled at most every 250 ms.
+fn live_limit() -> u64 {
+    static LIMIT: AtomicU64 = AtomicU64::new(KEPT);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if !bounded() {
+        return KEPT;
+    }
+    let now = crate::host::coarse_ms();
+    let next = NEXT.load(Relaxed);
+    if now >= next && NEXT.compare_exchange(next, now + 250, Relaxed, Relaxed).is_ok() {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: the API fills a correctly sized structure.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+            let headroom = status.ullAvailPhys.min(status.ullAvailPageFile);
+            LIMIT.store(kept_limit(true, status.ullTotalPhys, headroom), Relaxed);
+        }
+    }
+    LIMIT.load(Relaxed)
+}
+
+/// Levels kept in memory by blob, least recently used let go first.
+#[derive(Default)]
+struct Kept {
+    map: HashMap<u128, (Arc<Vec<u8>>, u64)>,
+    bytes: u64,
+    tick: u64,
+    /// Blobs let go to stay within the limit, since the start.
+    evicted: u64,
+}
+
+impl Kept {
+    fn get(&mut self, blob: u128) -> Option<Arc<Vec<u8>>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(&blob).map(|(bytes, used)| {
+            *used = tick;
+            bytes.clone()
+        })
+    }
+
+    /// Lets the least recently used go until at most `limit` bytes are kept,
+    /// [`TRIM_STEP`] bytes at most per call so that a sudden drop of the
+    /// limit is spread over several calls instead of one long stall.
+    fn trim(&mut self, limit: u64) {
+        let floor = self.bytes.saturating_sub(TRIM_STEP);
+        while self.bytes > limit && self.bytes > floor {
+            let Some((&blob, _)) = self.map.iter().min_by_key(|(_, (_, used))| *used) else {
+                break;
+            };
+            if let Some((bytes, _)) = self.map.remove(&blob) {
+                self.bytes -= bytes.len() as u64;
+                self.evicted += 1;
+            }
+        }
+    }
+
+    /// Keeps `bytes` if room for them within `limit` is made by letting older
+    /// ones go ([`trim`](Self::trim)); otherwise they are only on disk.
+    fn insert(&mut self, blob: u128, bytes: &Arc<Vec<u8>>, limit: u64) {
+        let len = bytes.len() as u64;
+        if self.map.contains_key(&blob) || len > limit {
+            self.trim(limit);
+            return;
+        }
+        self.trim(limit - len);
+        if self.bytes + len > limit {
+            return;
+        }
+        self.tick += 1;
+        self.bytes += len;
+        self.map.insert(blob, (bytes.clone(), self.tick));
+    }
+}
+
 /// A texture's shape: width, height, format, levels.
 pub(crate) type Shape = [u32; 4];
 
@@ -56,8 +163,7 @@ struct Entry {
 struct Store {
     folder: PathBuf,
     index: Mutex<HashMap<Key, Entry>>,
-    kept: Mutex<HashMap<u128, Arc<Vec<u8>>>>,
-    kept_bytes: AtomicU64,
+    kept: Mutex<Kept>,
     jobs: Mutex<mpsc::Sender<Job>>,
     /// Contents given to it this run (digests of whole textures).
     seen: Mutex<std::collections::HashSet<u128>>,
@@ -139,8 +245,7 @@ fn store() -> Option<&'static Store> {
             Some(Store {
                 folder,
                 index: Mutex::new(index),
-                kept: Mutex::new(HashMap::new()),
-                kept_bytes: AtomicU64::new(0),
+                kept: Mutex::new(Kept::default()),
                 jobs: Mutex::new(send),
                 seen: Mutex::new(std::collections::HashSet::new()),
             })
@@ -225,10 +330,7 @@ fn kept(store: &Store, job: Job) -> Option<(u128, Arc<Vec<u8>>, Vec<(Key, Entry)
             index.insert(*k, *e);
         }
     }
-    if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
-        store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-        store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, bytes.clone());
-    }
+    store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(blob, &bytes, live_limit());
     STATS[1].fetch_add(1, Relaxed);
     Some((blob, bytes, entries))
 }
@@ -244,16 +346,19 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
     if entry.levels != level {
         return None;
     }
-    let kept = store.kept.lock().unwrap_or_else(|e| e.into_inner()).get(&entry.blob).cloned();
+    let kept = {
+        let mut kept = store.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = kept.get(entry.blob);
+        // (A hit also lets go what no longer fits when memory got short.)
+        kept.trim(live_limit());
+        hit
+    };
     let bytes = match kept {
         Some(bytes) => bytes,
         None => {
             let bytes = Arc::new(std::fs::read(store.folder.join(format!("{:032x}.lv", entry.blob))).ok()?);
             STATS[4].fetch_add(1, Relaxed);
-            if store.kept_bytes.load(Relaxed) + bytes.len() as u64 <= KEPT {
-                store.kept_bytes.fetch_add(bytes.len() as u64, Relaxed);
-                store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, bytes.clone());
-            }
+            store.kept.lock().unwrap_or_else(|e| e.into_inner()).insert(entry.blob, &bytes, live_limit());
             bytes
         }
     };
@@ -265,12 +370,18 @@ pub(crate) fn find(shape: Shape, level: u32, smaller: &[u8]) -> Option<Arc<Vec<u
 pub(crate) fn line() -> Option<String> {
     let store = store()?;
     let [at_start, kept, asked, found, read, written] = [0, 1, 2, 3, 4, 5].map(|i| STATS[i].load(Relaxed));
+    let (kept_bytes, evicted) = {
+        let held = store.kept.lock().unwrap_or_else(|e| e.into_inner());
+        (held.bytes, held.evicted)
+    };
     Some(format!(
         "texture store (VICTORY_TEXTURE_STORE), since the start: {at_start} keys from earlier runs, {kept} textures kept \
-         ({} MB written, {} MB held in memory), {asked} first views from a smaller level asked, {found} found ({read} read \
-         from the folder), {} host copies made whole from it",
+         ({} MB written, {} MB held in memory, limit {} MB, {} let go), {asked} first views from a smaller level asked, \
+         {found} found ({read} read from the folder), {} host copies made whole from it",
         written >> 20,
-        store.kept_bytes.load(Relaxed) >> 20,
+        kept_bytes >> 20,
+        live_limit() >> 20,
+        evicted,
         PREFILLED.load(Relaxed)
     ))
 }
@@ -290,5 +401,153 @@ mod tests {
         assert_eq!(k, key);
         assert_eq!((e.blob, e.levels), (entry.blob, entry.levels));
         assert!(parse_line("1 2 3").is_none());
+    }
+
+    #[test]
+    fn kept_limit_follows_host_memory() {
+        // Off: the old fixed bound whatever the host.
+        assert_eq!(kept_limit(false, 32 * GIB, GIB), KEPT);
+        // A 64 GiB host with plenty free keeps the full bound, a 32 GiB one a quarter.
+        assert_eq!(kept_limit(true, 64 * GIB, 40 * GIB), KEPT);
+        assert_eq!(kept_limit(true, 32 * GIB, 20 * GIB), GIB);
+        // At most an eighth of the headroom.
+        assert_eq!(kept_limit(true, 64 * GIB, 8 * GIB), GIB);
+        // Watch and high pressure.
+        assert_eq!(kept_limit(true, 64 * GIB, 5 * GIB), 256 * MIB);
+        assert_eq!(kept_limit(true, 32 * GIB, 2 * GIB - 1), 0);
+    }
+
+    #[test]
+    fn kept_evicts_least_recent_first() {
+        let mut kept = Kept::default();
+        let blob = |n: usize| Arc::new(vec![0u8; n]);
+        kept.insert(1, &blob(100), 300);
+        kept.insert(2, &blob(100), 300);
+        kept.insert(3, &blob(100), 300);
+        assert!(kept.get(1).is_some()); // 2 is now the least recent
+        kept.insert(4, &blob(100), 300);
+        assert!(kept.get(2).is_none());
+        assert!(kept.get(1).is_some() && kept.get(3).is_some() && kept.get(4).is_some());
+        assert_eq!((kept.bytes, kept.evicted), (300, 1));
+        // Too large alone: not kept, and nothing else is let go for it.
+        kept.insert(5, &blob(400), 300);
+        assert!(kept.get(5).is_none());
+        assert_eq!(kept.bytes, 300);
+        // Memory got short: trimming lets go down to the new limit.
+        kept.trim(150);
+        assert_eq!((kept.bytes, kept.map.len()), (100, 1));
+        kept.trim(0);
+        assert_eq!((kept.bytes, kept.map.len()), (0, 0));
+    }
+
+    #[test]
+    fn kept_trims_a_large_drop_in_steps() {
+        let mut kept = Kept::default();
+        let mib = Arc::new(vec![0u8; MIB as usize]);
+        for blob in 0..200 {
+            kept.insert(blob, &mib, GIB);
+        }
+        assert_eq!(kept.bytes, 200 * MIB);
+        kept.trim(0);
+        assert_eq!(kept.bytes, 200 * MIB - TRIM_STEP, "one step per call");
+        // While above the limit a new texture is not kept.
+        kept.insert(1000, &mib, 8 * MIB);
+        assert!(kept.get(1000).is_none());
+        for _ in 0..4 {
+            kept.trim(8 * MIB);
+        }
+        assert_eq!(kept.bytes, 8 * MIB);
+    }
+
+    fn process_memory() -> (u64, u64, u64) {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a correctly sized structure for the current process.
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) };
+        (c.PrivateUsage as u64, c.PeakPagefileUsage as u64, c.PeakWorkingSetSize as u64)
+    }
+
+    fn process_cpu_ns() -> u64 {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        let mut t: [FILETIME; 4] = unsafe { std::mem::zeroed() };
+        let [a, b, c, d] = &mut t;
+        // SAFETY: four valid FILETIME outputs for the current process.
+        unsafe { GetProcessTimes(GetCurrentProcess(), a, b, c, d) };
+        let ft = |f: &FILETIME| (u64::from(f.dwHighDateTime) << 32 | u64::from(f.dwLowDateTime)) * 100;
+        ft(&t[2]) + ft(&t[3])
+    }
+
+    /// Synthetic texture-streaming stress (T-0039): 768 frames each keep a
+    /// new 4 MiB texture's levels and look up four earlier ones, on a
+    /// simulated 32 GiB host whose headroom falls from 10 GiB as the title's
+    /// own memory grows (8 MiB a frame) and as the store keeps levels. A miss
+    /// is made again as the store would after reading the folder (no disk
+    /// I/O here). The bound is `VICTORY_TEXSTORE_BOUND` (default on). Prints
+    /// one `texstore-stress {json}` line; run by `resource_pressure.py measure`.
+    #[test]
+    #[ignore = "synthetic stress workload (resource_pressure.py measure)"]
+    fn texstore_pressure_synthetic_stream() {
+        const FRAMES: usize = 768;
+        const SIZE: usize = 4 << 20;
+        let bound = bounded();
+        let make = |frame: usize| {
+            let mut v = vec![0u8; SIZE];
+            v.iter_mut().step_by(4096).for_each(|b| *b = frame as u8 | 1);
+            Arc::new(v)
+        };
+        let (start_private, _, _) = process_memory();
+        let start_cpu = process_cpu_ns();
+        let mut kept = Kept::default();
+        let (mut peak_private, mut peak_kept, mut hits, mut misses) = (0u64, 0u64, 0u64, 0u64);
+        let mut frame_ns = Vec::with_capacity(FRAMES);
+        for frame in 0..FRAMES {
+            let began = std::time::Instant::now();
+            let headroom = (10 * GIB).saturating_sub(frame as u64 * 8 * MIB).saturating_sub(kept.bytes);
+            let limit = kept_limit(bound, 32 * GIB, headroom);
+            kept.insert(frame as u128, &make(frame), limit);
+            for back in [1usize, 2, 8, 200] {
+                let Some(earlier) = frame.checked_sub(back) else { continue };
+                let hit = kept.get(earlier as u128);
+                kept.trim(limit);
+                match hit {
+                    Some(bytes) => {
+                        hits += 1;
+                        std::hint::black_box(bytes[0]);
+                    }
+                    None => {
+                        misses += 1;
+                        kept.insert(earlier as u128, &make(earlier), limit);
+                    }
+                }
+            }
+            frame_ns.push(began.elapsed().as_nanos() as u64);
+            peak_kept = peak_kept.max(kept.bytes);
+            peak_private = peak_private.max(process_memory().0);
+        }
+        let cpu = process_cpu_ns() - start_cpu;
+        let (_, peak_commit, peak_working_set) = process_memory();
+        frame_ns.sort_unstable();
+        let pct = |p: f64| frame_ns[((FRAMES as f64 - 1.0) * p) as usize] as f64 / 1e6;
+        println!(
+            "texstore-stress {{\"bound\": {bound}, \"frames\": {FRAMES}, \"peak_kept_mib\": {}, \
+             \"peak_private_mib\": {}, \"private_growth_mib\": {}, \"peak_commit_mib\": {}, \
+             \"peak_working_set_mib\": {}, \"cpu_ms_per_frame\": {:.4}, \"frame_ms_p50\": {:.4}, \
+             \"frame_ms_p99\": {:.4}, \"frame_ms_max\": {:.4}, \"hits\": {hits}, \"misses\": {misses}, \
+             \"evicted\": {}}}",
+            peak_kept >> 20,
+            peak_private >> 20,
+            peak_private.saturating_sub(start_private) >> 20,
+            peak_commit >> 20,
+            peak_working_set >> 20,
+            cpu as f64 / 1e6 / FRAMES as f64,
+            pct(0.5),
+            pct(0.99),
+            pct(1.0),
+            kept.evicted
+        );
+        assert!(!bound || peak_kept <= GIB, "the bound held");
     }
 }
