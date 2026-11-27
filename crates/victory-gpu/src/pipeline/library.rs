@@ -655,6 +655,8 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            queued_at_creation = super::make::EAGER.load(Ordering::Relaxed),
+            queued_at_creation_used = super::make::EAGER_USED.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
